@@ -6,6 +6,13 @@ from opensimplex import random_seed as SimplexNoiseSeed
 from scipy.spatial import Voronoi, voronoi_plot_2d, KDTree
 from tqdm import tqdm  # Import de tqdm pour la barre de progression
 
+poi_default_density = {"ville" : 5,
+                      "village" : 15,
+                      "agriculture" : 15,
+                      "mine" : 15,
+                      "lieu_sacre" : 3,
+                      "ruine" : 5}
+
 class MapParameters:
     """Classe pour stocker les paramètres de génération de la carte."""
 
@@ -25,7 +32,10 @@ class MapParameters:
                  evaporation=0.3,
                  angle_variation_winds = 15.0,
                  num_angles_winds = 5,
-                 water_flow_threshold=0.005):
+                 water_flow_threshold=0.005,
+                 poi_density_dict = poi_default_density,
+                 poi_taken_radius = 3,
+                 poi_influence_radius = 3):
         """
         raininess : Contrôle la quantité de pluie générée par l'humidité des nuages.
             Valeur recommandée : 0.5 à 1.0
@@ -70,6 +80,10 @@ class MapParameters:
         self.angle_variation_winds = angle_variation_winds
 
         self.water_flow_threshold = water_flow_threshold
+
+        self.poi_density_dict = poi_density_dict
+        self.poi_taken_radius = poi_taken_radius
+        self.poi_influence_radius = poi_influence_radius
 
 
 
@@ -631,6 +645,161 @@ class BiomeClassifier:
         self.voronoi_biomes = voronoi_biomes
 
 
+
+# ============================================================================
+# 5. POINT D'INTERET - Places des villes, villages, mines ...
+# ============================================================================
+
+class PointOfInterestGenerator:
+    def __init__(self, terrain, hydro, biomes, parameters):
+        self.terrain = terrain
+        self.hydro = hydro
+        self.biomes = biomes
+        self.parameters = parameters
+
+        # Résultats
+        self.poi_data = {}  # { "villes": [...], "villages": [...], etc. }
+        self.routes = []  # liste de tuples de cellules ou de segments
+        self.territories = {}  # cellule_voronoi_id -> id_cité
+        self.fortresses = []  # liste de cellules
+
+
+    def compute_scores(self):
+        n = self.terrain.voronoi_obj.npoints
+
+        altitude = self.terrain.voronoi_altitude
+        moisture = self.hydro.voronoi_moisture
+        biome = self.biomes.voronoi_biomes
+        river_mask = np.zeros(n, dtype=float)
+        river_mask[self.hydro.water_cells] = 1.0
+        self.scores = {}
+
+        def gaussian_centered(x, center=0.5, width=0.2):
+            """Fonction cloche centrée (valeurs entre 0 et 1)."""
+            return np.exp(-((x - center) ** 2) / (2 * width ** 2))
+
+        # Base scoring components
+        alt_score = gaussian_centered(altitude, 0.5)
+        moist_score = gaussian_centered(moisture, 0.5)
+        river_proximity_score = self._compute_river_proximity()
+
+        # Biome coefficients
+        biome_weights = {
+            "Prairie fertile": 1.2,
+            "Forêt clairsemée": 1.0,
+            "Forêt dense": 0.9,
+            "Zone humide": 0.7,
+            "Brousaille": 0.6,
+            "Neige": 0.3,
+            "Sommets arides": 0.2,
+            "Rocaille": 0.4,
+            "Thoundra": 0.4,
+            "Plaines sèches": 0.6,
+            "Marais boisé": 0.7,
+            "Eau": 0.0,
+        }
+        biome_score = np.array([biome_weights.get(b, 0.5) for b in biome])
+
+        # Score par type
+        self.scores["ville"] = (
+            0.6 * alt_score + 0.6 * moist_score + 0.5 * river_proximity_score
+        ) * biome_score
+
+        self.scores["village"] = (
+            0.5 * alt_score + 0.5 * moist_score + 0.4 * river_proximity_score
+        ) * biome_score
+
+        self.scores["agriculture"] = (
+            0.7 * moist_score + 0.3 * river_proximity_score
+        ) * (biome == "Prairie fertile")
+
+        self.scores["mine"] = (
+            gaussian_centered(altitude, 0.85, 0.15) * (1 - moist_score)
+        ) * ((biome == "Rocaille") | (biome == "Sommets arides"))
+
+        self.scores["lieu_sacre"] = (
+            gaussian_centered(altitude, 0.95, 0.2)
+            + gaussian_centered(altitude, 0.05, 0.2)
+            + gaussian_centered(moisture, 0.95, 0.2)
+        ) * ((biome == "Zone humide") | (biome == "Forêt dense") | (biome == "Sommets arides"))
+
+        self.scores["ruine"] = 0.5 * alt_score + 0.5 * (1 - river_proximity_score)
+
+    def _compute_river_proximity(self, decay=0.95):
+        """Retourne un score de proximité à l’eau basé sur la distance aux cellules d’eau."""
+        points = np.array(self.terrain.voronoi_obj.points)
+        water_points = points[self.hydro.water_cells]
+        score = np.zeros(points.shape[0])
+
+        for i, pi in enumerate(points):
+            dist = np.linalg.norm(water_points - pi, axis=1).min()
+            score[i] = decay ** dist
+        return score
+
+    def place_settlements(self):
+        density_dict = self.parameters.poi_density_dict
+        taken_radius = self.parameters.poi_taken_radius
+        influence_radius = self.parameters.poi_influence_radius
+
+        points = np.array(self.terrain.voronoi_obj.points)
+        n = points.shape[0]
+
+        for name in self.scores:
+            dists = points[:,0]
+            decay = 1 - 1 / (1 + dists / influence_radius)
+            self.scores[name] *= decay
+
+            dists = points[:, 0].max() - points[:, 0]
+            decay = 1 - 1 / (1 + dists / influence_radius)
+            self.scores[name] *= decay
+
+            dists = points[:, 1]
+            decay = 1 - 1 / (1 + dists / influence_radius)
+            self.scores[name] *= decay
+
+            dists = points[:, 1].max() - points[:, 1]
+            decay = 1 - 1 / (1 + dists / influence_radius)
+            self.scores[name] *= decay
+
+        taken = np.zeros(n, dtype=bool)
+        for poi_name in self.scores :
+            poi_num = density_dict.get(poi_name,None)
+            if poi_num is None :
+                Warning(f"Le POI {poi_name} n'a pas de densité de définie")
+                continue
+            poi_indice_list = []
+            for i in range(poi_num):
+                sorted_indices = np.argsort(-self.scores[poi_name])
+                for idx in sorted_indices:
+                    if taken[idx]: continue
+                    poi_indice_list.append(idx)
+                    dists = np.linalg.norm(points - points[idx], axis=1)
+                    taken[np.where(dists < taken_radius)[0]] = True
+                    decay = 1 - 1/(1+dists/influence_radius)
+                    for name in self.scores :
+                        self.scores[name] *= decay
+                    break
+            self.poi_data[poi_name] = poi_indice_list
+
+
+
+
+    def generate_routes(self):
+        """Crée les routes reliant les colonies (chemin entre cellules Voronoï)."""
+        pass
+
+    def assign_territories(self):
+        """Rattache chaque cellule à une ville principale (territoire)."""
+        pass
+
+    def place_fortresses(self):
+        """Place des forteresses aux points stratégiques (routes/frontières)."""
+        pass
+
+    def place_special_sites(self):
+        """Place lieux sacrés et ruines loin de l'habitation humaine."""
+        pass
+
 # ============================================================================
 # 4. MAP VISUALIZER - Responsabilité : Affichage et visualisation
 # ============================================================================
@@ -645,10 +814,12 @@ class MapVisualizer:
 
     def __init__(self, terrain: TerrainGenerator,
                  hydro: HydrographyGenerator = None,
-                 biomes: BiomeClassifier = None):
+                 biomes: BiomeClassifier = None,
+                 poi: PointOfInterestGenerator = None):
         self.terrain = terrain
         self.hydro = hydro
         self.biomes = biomes
+        self.pointOfInterest = poi
 
     def show_elevation_map(self, ax=None):
         """Affiche la carte d'élévation"""
@@ -706,10 +877,46 @@ class MapVisualizer:
         ax.set(xlim=[1, self.terrain.parameters.width - 1],
                ylim=[1, self.terrain.parameters.height - 1])
 
+    def show_poi_map(self, ax=None):
+        if ax is None:
+            fig, ax = plt.subplots()
+
+        vor = self.terrain.voronoi_obj
+        points = self.terrain.voronoi_obj.points
+        regions = vor.regions
+        region_map = vor.point_region
+
+        # Styles par PoI
+        poi_styles = {
+            "ville": ("red", "o", 80),
+            "village": ("orange", "^", 60),
+            "mine": ("gray", "X", 50),
+            "agriculture": ("green", "s", 30),
+            "lieu_sacre": ("purple", "*", 120),
+            "ruine": ("black", "P", 40),
+        }
+
+        for poi_type, indices in self.pointOfInterest.poi_data.items():
+            color, marker, size = poi_styles.get(poi_type, ("black", ".", 10))
+            pts = points[indices]
+
+            # Remplir les cellules Voronoï
+            for idx in indices:
+                region_idx = region_map[idx]
+                region = regions[region_idx]
+                if -1 in region or len(region) == 0:
+                    continue
+                polygon = [vor.vertices[i] for i in region]
+                ax.fill(*zip(*polygon), color=color, alpha=0.2)
+
+            # Afficher les centres
+            ax.scatter(pts[:, 0], pts[:, 1], s=size, c=color, marker=marker, label=poi_type)
+
+        ax.legend(loc="upper right", fontsize="small")
 
 
 # ============================================================================
-# 5. ORCHESTRATEUR PRINCIPAL - Coordonne tout
+# 6. ORCHESTRATEUR PRINCIPAL - Coordonne tout
 # ============================================================================
 
 class WorldGenerator:
@@ -742,20 +949,42 @@ class WorldGenerator:
         self.biomes = BiomeClassifier(self.terrain, self.hydro)
         self.biomes.classify_biomes()
 
+        print("Placement des points d'intérêts ...")
+        self.pointOfInterest = PointOfInterestGenerator(self.terrain,
+                                                        self.hydro,
+                                                        self.biomes,
+                                                        self.parameters)
+        self.pointOfInterest.compute_scores()
+        self.pointOfInterest.place_settlements()
+
         print("Initialisation du visualiseur...")
-        self.visualizer = MapVisualizer(self.terrain, self.hydro, self.biomes)
+        self.visualizer = MapVisualizer(self.terrain, self.hydro, self.biomes, self.pointOfInterest)
+
 
 
 # ============================================================================
-# 6. UTILISATION - Plus simple et claire
+# 7. UTILISATION - Plus simple et claire
 # ============================================================================
 
 if __name__ == "__main__":
     # Configuration
     params = MapParameters(
-        width=800, height=800,
+        width=640,
+        height=640,
         scale_octave=5.0,
-        # ... autres paramètres
+        amplitude_func="Pow",
+        octaves=8,
+        voronoi_scale=2,
+        altitude_transform_mixing=0.5,
+        altitude_transform_exponent=0.8,
+        distribution_exponent=2.2,
+        show_progress_bar=True,
+        raininess=0.5,
+        rain_shadow=0.2,
+        evaporation=0.2,
+        angle_variation_winds=30.0,
+        num_angles_winds=15,
+        water_flow_threshold=0.01,
     )
     figsize = (max(5, min(9, params.width * 5 / 250)),
                max(5, min(9, params.width * 5 / 250)))
@@ -764,20 +993,19 @@ if __name__ == "__main__":
     world = WorldGenerator(params)
     world.generate_complete_world()
 
+
     print("Affichage ...")
     figure = plt.figure(figsize=figsize)
     ax = figure.add_subplot(111)
     figure.tight_layout()
     world.visualizer.show_elevation_map(ax)
-
-    # figure = plt.figure(figsize=figsize)
-    # ax = figure.add_subplot(111)
-    # figure.tight_layout()
     world.visualizer.show_river_network(ax)
+    world.visualizer.show_poi_map(ax)
 
     figure = plt.figure(figsize=figsize)
     ax = figure.add_subplot(111)
     figure.tight_layout()
     world.visualizer.show_biome_map(ax)
+    world.visualizer.show_poi_map(ax)
 
     plt.show()
